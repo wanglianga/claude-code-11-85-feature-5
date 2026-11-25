@@ -201,6 +201,113 @@ def run_acceptance(db: Session) -> dict:
          "policies": len(snap1.policy_versions) if snap1 else 0,
          "judgment_version": j1.version, "snapshot_no": j1.snapshot_no}))
 
+    checks.extend(_hitrate_checks(db))
     passed = sum(1 for c in checks if c["passed"])
-    return {"overall": passed == len(checks), "passed": passed,
-            "total": len(checks), "checks": checks}
+    return {"overall": passed == len(checks),
+            "passed": passed, "total": len(checks), "checks": checks}
+
+
+def _hitrate_checks(db: Session) -> list[dict]:
+    """冻结排序命中率评估的三项验收断言。"""
+    from .models import FreezeBatch, FreezeCandidate
+    from .services import hitrate as stats
+
+    out = []
+    main = db.query(FreezeBatch).filter_by(code="FB-2026Q1-TOP10PCT").first()
+    stress = db.query(FreezeBatch).filter_by(code="FB-STRESS-UNRECORDED").first()
+    if not main or not stress:
+        return [_chk("hitrate_seed", "命中率评估批次已播种", False,
+                     "两个冻结批次存在", "缺失", "")]
+
+    def rows_of(batch):
+        return [{
+            "region": c.region, "review_source": c.review_source,
+            "evidence_label": c.evidence_label,
+            "review_probability": c.review_probability,
+            "censor_status": c.censor_status,
+            "recorded_factors": c.recorded_factors or {},
+            "candidate_code": c.candidate_code,
+        } for c in db.query(FreezeCandidate).filter_by(batch_id=batch.id)
+            .order_by(FreezeCandidate.rank_no).all()]
+
+    main_rows = rows_of(main)
+    strata = stats.build_strata(main_rows, ("A", "B"))
+    a, b = strata["A"], strata["B"]
+    # 11) 冻结候选集与分层核查概率账完全符合题设
+    accounting_ok = (
+        len(main_rows) == 100 and a["N"] == 50 and b["N"] == 50
+        and (a["n_hist"], a["y_hist"]) == (40, 20)
+        and (a["M_unreviewed"], a["m_audit"], a["k_audit"]) == (10, 5, 2)
+        and a["n_censored"] == 5 and abs(a["pi_hist"] - 0.8) < 1e-9
+        and abs(a["pi_audit"] - 0.5) < 1e-9
+        and (b["n_hist"], b["y_hist"]) == (10, 3)
+        and (b["M_unreviewed"], b["m_audit"], b["k_audit"]) == (40, 10, 2)
+        and b["n_censored"] == 30 and abs(b["pi_hist"] - 0.2) < 1e-9
+        and abs(b["pi_audit"] - 0.25) < 1e-9
+    )
+    # 确认标签、删失状态、概率预测分别保存；待核件无标签且不计阴性
+    storage_ok = all(
+        (r["censor_status"] == "censored") == (r["evidence_label"] is None)
+        for r in main_rows
+    )
+    out.append(_chk(
+        "hitrate_frozen_accounting",
+        "冻结候选集/核查概率账/确认标签/删失状态与题设一致且分列存储",
+        accounting_ok and storage_ok,
+        "100 件 A/B 各 50；A 40(20)+未核10 抽5确认2、删失5；B 10(3)+未核40 抽10确认2、删失30；π=0.8/0.2 与 0.5/0.25",
+        {"A": {k: a[k] for k in ("N", "n_hist", "y_hist", "M_unreviewed",
+                                 "m_audit", "k_audit", "n_censored",
+                                 "pi_hist", "pi_audit")},
+         "B": {k: b[k] for k in ("N", "n_hist", "y_hist", "M_unreviewed",
+                                 "m_audit", "k_audit", "n_censored",
+                                 "pi_hist", "pi_audit")},
+         "label_censor_separated": storage_ok}))
+
+    # 12) 双路点估计与 95% 区间：35%（超几何）与 40%（IPW），区间重叠
+    res = stats.evaluate_hitrate(main_rows, ("A", "B"))
+    ra, ip = res["random_audit"], res["ipw"]
+    two_path_ok = (
+        ra["identifiable"] and ip["identifiable"]
+        and ra["point_estimate"] == 35.0
+        and ra["estimated_confirmed"] == 35.0
+        and ra["ci95"][0] <= 35.0 <= ra["ci95"][1]
+        and ip["point_estimate"] == 40.0
+        and ip["estimated_confirmed"] == 40.0
+        and ip["ci95"][0] <= 40.0 <= ip["ci95"][1]
+        and res["comparison"]["overlap"] is True
+        and abs(res["naive_adjudicated"]["rate_pp"] - 41.54) < 0.01
+    )
+    out.append(_chk(
+        "hitrate_two_path_estimates",
+        "随机复核路 35%（分层超几何区间）、概率校正路 40%（重抽样区间），区间重叠；已办阳性率仅对照",
+        two_path_ok,
+        "RANDOM 35% 且 CI 覆盖 35；IPW 40% 且 CI 覆盖 40；两区间重叠；naive=41.54% 不作目标量",
+        {"random": {"point": ra["point_estimate"], "ci95": ra["ci95"],
+                    "method": ra["ci95_method"]},
+         "ipw": {"point": ip["point_estimate"], "ci95": ip["ci95"],
+                 "method": ip["ci95_method"]},
+         "overlap": res["comparison"]["overlap"],
+         "naive_adjudicated_rate": res["naive_adjudicated"]["rate_pp"]}))
+
+    # 13) 不可识别护栏：零核查概率/未记录混杂 → 不得外推、不得宣称提升
+    sres = stats.evaluate_hitrate(rows_of(stress), ("A", "B"))
+    guard_ok = (
+        not sres["random_audit"]["identifiable"]
+        and not sres["ipw"]["identifiable"]
+        and sres["identifiability"]["can_claim_ranking_lift"] is False
+        and any(x["stratum"] == "B" for x in sres["random_audit"]["blocked_strata"])
+        and any(x["stratum"] == "B" for x in sres["ipw"]["blocked_strata"])
+        and len(sres["identifiability"]["unrecorded_confounders"]) > 0
+        and res["identifiability"]["can_claim_ranking_lift"] is True
+    )
+    out.append(_chk(
+        "hitrate_identifiability_guardrail",
+        "关键层零核查概率/未记录混杂时两路不可识别、不得宣称排序提升；主批次不受影响",
+        guard_ok,
+        "压力批次 B 层阻断且 can_claim=False；主批次 can_claim=True",
+        {"stress_random_blocked": sres["random_audit"]["blocked_strata"],
+         "stress_ipw_blocked": sres["ipw"]["blocked_strata"],
+         "unrecorded": sres["identifiability"]["unrecorded_confounders"],
+         "stress_can_claim": sres["identifiability"]["can_claim_ranking_lift"],
+         "main_can_claim": res["identifiability"]["can_claim_ranking_lift"]}))
+    return out

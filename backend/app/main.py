@@ -9,18 +9,19 @@ from fastapi.staticfiles import StaticFiles
 from .config import settings
 from .database import Base, SessionLocal, engine
 from .models import User
-from .routers import auth, cases, graph, identity, patterns, snapshots, sources, tools
+from .routers import auth, cases, graph, hitrate, identity, patterns, snapshots, sources, tools
 
 app = FastAPI(title=settings.APP_NAME, version="1.0.0",
               description="来源账 / 身份解析 / 受限图扩展 / 模式求值 / 反证编排 / "
-                          "案件投影 / 快照复演")
+                          "案件投影 / 快照复演 / 冻结排序命中率评估")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=False,
     allow_methods=["*"], allow_headers=["*"])
 
 for r in (auth.router, sources.router, identity.router, graph.router,
-          patterns.router, cases.router, snapshots.router, tools.router):
+          patterns.router, cases.router, snapshots.router, tools.router,
+          hitrate.router):
     app.include_router(r)
 
 

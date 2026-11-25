@@ -19,6 +19,7 @@ from .models import (
     Case,
     CounterCheck,
     Delivery,
+    FreezeBatch,
     GraphEdge,
     GraphNode,
     IdentityEvidence,
@@ -669,6 +670,15 @@ def run_seed(reset: bool = True):
             db.flush()
             case.current_judgment_id = j.id
             case.first_snapshot_id = snap.id
+        db.commit()
+
+        # 9) 冻结排序 Top-10% 命中率评估批次 + 首次双路评估留痕
+        from .hitrate_seed import seed_freeze_hitrate
+        from .routers.hitrate import run_evaluation
+        seed_freeze_hitrate(db)
+        for fb in db.query(FreezeBatch).order_by(FreezeBatch.id).all():
+            run_evaluation(db, fb, author="system",
+                           note="种子初始化：分层随机复核路 + 已办概率校正路双路评估")
         db.commit()
         print(f"[seed] OK: {db.query(Person).count()} persons, "
               f"{db.query(SourceRecord).count()} source records, "

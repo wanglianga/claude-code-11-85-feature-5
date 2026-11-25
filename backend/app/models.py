@@ -519,3 +519,70 @@ class ModelRun(Base):
     weights: Mapped[dict] = mapped_column(JSONB, default=dict)
     calibration: Mapped[dict] = mapped_column(JSONB, default=dict)
     note: Mapped[str] = mapped_column(Text)
+
+
+# ---------------------------------------------------------------- 冻结排序命中率评估
+class FreezeBatch(Base):
+    """冻结候选批次：固定排序版本、截止日与 Top-N 候选集，评估期间不可变。
+
+    评估目标是该批 Top-N 中“经规定证据确认欺诈”的比例（命中率），
+    而非已办案件的阳性率。
+    """
+    __tablename__ = "freeze_batch"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(256))
+    ranking_version: Mapped[str] = mapped_column(String(64))  # 冻结的排序模型/规则版本
+    cutoff_date: Mapped[datetime] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # 冻结口径：{target: "top_10pct", universe_size, top_n, score_field, strata:[...]}
+    scope: Mapped[dict] = mapped_column(JSONB, default=dict)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class FreezeCandidate(Base):
+    """冻结候选集中的单个案件（Top-N 成员），分数与排名在冻结时固定。"""
+    __tablename__ = "freeze_candidate"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("freeze_batch.id"), index=True)
+    rank_no: Mapped[int] = mapped_column(Integer, index=True)  # 冻结名次 1..N
+    candidate_code: Mapped[str] = mapped_column(String(48), index=True)  # HC-001...
+    region: Mapped[str] = mapped_column(String(16), index=True)  # 分层 A/B
+    frozen_score: Mapped[float] = mapped_column(Float)
+    score_band: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # 核查来源：historical（历史已办）/ random_audit（分层随机复核）/ none（未核查）
+    review_source: Mapped[str] = mapped_column(String(24), default="none", index=True)
+    # 核查概率账（与确认标签分开保存）：该件被核查的条件概率 π
+    review_probability: Mapped[float | None] = mapped_column(Float, nullable=True)
+    probability_basis: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # 证据确认标签（仅对已核查件非空）：confirmed=规定证据确认欺诈 / cleared=经证据排除
+    # 待核/右删失件保持 NULL，绝不计为阴性
+    evidence_label: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    evidence_codes: Mapped[list] = mapped_column(JSONB, default=list)  # 规定证据引用
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # censored=右删失/待核（不计阴性）；resolved=已有证据结论
+    censor_status: Mapped[str] = mapped_column(String(16), default="censored", index=True)
+    # 概率预测（与确认标签、删失状态分别保存）：选择模型给出的核查倾向分
+    propensity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 已记录的转介等选择因素（未记录因素是不可识别风险来源）
+    recorded_factors: Mapped[dict] = mapped_column(JSONB, default=dict)
+    __table_args__ = (
+        UniqueConstraint("batch_id", "candidate_code", name="uq_freeze_candidate"),
+    )
+
+
+class HitRateRun(Base):
+    """一次命中率评估运行：两路估计、95% 区间与可识别性结论整体冻结留痕。"""
+    __tablename__ = "hit_rate_run"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("freeze_batch.id"), index=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    author: Mapped[str] = mapped_column(String(64), default="system")
+    method_note: Mapped[str] = mapped_column(Text, default="")
+    # random_audit=分层随机复核路；ipw=已办样本概率校正路
+    random_audit_result: Mapped[dict] = mapped_column(JSONB, default=dict)
+    ipw_result: Mapped[dict] = mapped_column(JSONB, default=dict)
+    comparison: Mapped[dict] = mapped_column(JSONB, default=dict)  # 重叠/分歧
+    # 不可识别层与原因（零核查概率 / 未记录混杂）
+    identifiability: Mapped[dict] = mapped_column(JSONB, default=dict)
+    conclusion: Mapped[str] = mapped_column(Text)
